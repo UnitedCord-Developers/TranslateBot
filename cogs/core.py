@@ -73,6 +73,15 @@ class Core(commands.Cog):
         await interaction.response.send_message("🗑️ 連携を解除しました", ephemeral=True)
 
     # =========================
+    # confidence 操作
+    # =========================
+    def adjust_confidence(self, entry, delta):
+        entry["confidence"] = max(
+            0.0,
+            min(entry.get("confidence", 0.3) + delta, 1.0)
+        )
+
+    # =========================
     # メッセージ監視
     # =========================
     @commands.Cog.listener()
@@ -87,10 +96,11 @@ class Core(commands.Cog):
         source_lang = self.channel_links[cid]["lang"]
         content = message.content
 
-        # JSON翻訳を優先
-        translated = self.translate_from_json(content, source_lang)
+        translated, entry = self.translate_from_json(content, source_lang)
 
-        if not translated:
+        if translated:
+            self.adjust_confidence(entry, +0.03)
+        else:
             translated = await self.translate_api(content, source_lang)
 
         await self.broadcast(message, translated, source_lang)
@@ -99,16 +109,24 @@ class Core(commands.Cog):
     # JSON翻訳
     # =========================
     def translate_from_json(self, text, src_lang):
-        results = {}
         for eid, entry in self.translate_db["entries"].items():
-            if src_lang in entry["languages"]:
-                for phrase in entry["languages"][src_lang]:
-                    ratio = SequenceMatcher(None, text.lower(), phrase.lower()).ratio()
-                    if ratio > 0.9:
-                        for lang, variants in entry["languages"].items():
-                            results[lang] = variants[0]
-                        return results
-        return None
+            if src_lang not in entry["languages"]:
+                continue
+
+            for phrase in entry["languages"][src_lang]:
+                ratio = SequenceMatcher(None, text.lower(), phrase.lower()).ratio()
+
+                if ratio > 0.9:
+                    self.adjust_confidence(entry, +0.05 if ratio > 0.97 else +0.02)
+
+                    results = {}
+                    for lang, variants in entry["languages"].items():
+                        results[lang] = variants[0]
+
+                    save_json(DATA_PATH, self.translate_db)
+                    return results, entry
+
+        return None, None
 
     # =========================
     # Google API 翻訳
@@ -127,8 +145,7 @@ class Core(commands.Cog):
                 }
                 async with session.post(GOOGLE_TRANSLATE_URL, json=payload) as resp:
                     data = await resp.json()
-                    translated = data["data"]["translations"][0]["translatedText"]
-                    results[target] = translated
+                    results[target] = data["data"]["translations"][0]["translatedText"]
 
         self.register_translation(text, src_lang, results)
         return results
@@ -142,6 +159,7 @@ class Core(commands.Cog):
         self.translate_db["entries"][new_id] = {
             "context": "unknown",
             "confidence": 0.3,
+            "last_modified": time.time(),
             "languages": {
                 src_lang: [src_text],
                 **{lang: [txt] for lang, txt in translated.items()}
@@ -157,39 +175,43 @@ class Core(commands.Cog):
             if info["lang"] == src_lang:
                 continue
 
-            webhook = discord.Webhook.from_url(
-                info["webhook"],
-                session=aiohttp.ClientSession()
-            )
+            async with aiohttp.ClientSession() as session:
+                webhook = discord.Webhook.from_url(info["webhook"], session=session)
 
-            content = translated.get(info["lang"])
-            if not content:
-                continue
+                content = translated.get(info["lang"])
+                if not content:
+                    continue
 
-            await webhook.send(
-                content,
-                username=message.author.display_name,
-                avatar_url=message.author.display_avatar.url
-            )
-            # broadcast 内の await webhook.send(...) の直後に追加
-            await sent_message.add_reaction("❓")
+                sent = await webhook.send(
+                    content,
+                    username=message.author.display_name,
+                    avatar_url=message.author.display_avatar.url,
+                    wait=True
+                )
 
+                await sent.add_reaction("❓")
+
+    # =========================
+    # ❓リアクション
+    # =========================
     @commands.Cog.listener()
     async def on_reaction_add(self, reaction, user):
-        if user.bot:
-            return
-
-        if str(reaction.emoji) != "❓":
+        if user.bot or str(reaction.emoji) != "❓":
             return
 
         message = reaction.message
-        if not message.embeds and not message.content:
-            return
+
+        for entry in self.translate_db["entries"].values():
+            for variants in entry["languages"].values():
+                if message.content in variants:
+                    self.adjust_confidence(entry, -0.05)
+                    save_json(DATA_PATH, self.translate_db)
+                    break
 
         await message.channel.send_modal(
             TranslationFixModal(self, message)
         )
-        
+
 class TranslationFixModal(discord.ui.Modal, title="翻訳修正"):
 
     def __init__(self, cog, message):
@@ -202,36 +224,30 @@ class TranslationFixModal(discord.ui.Modal, title="翻訳修正"):
             style=discord.TextStyle.long,
             required=True
         )
-
         self.add_item(self.correct_text)
 
     async def on_submit(self, interaction: discord.Interaction):
         fixed = self.correct_text.value.strip()
 
-        updated = False
-
-        for eid, entry in self.cog.translate_db["entries"].items():
+        for entry in self.cog.translate_db["entries"].values():
             for lang, variants in entry["languages"].items():
                 if self.message.content in variants:
                     if fixed not in variants:
                         variants.append(fixed)
-                        entry["confidence"] = min(
-                            entry.get("confidence", 0.3) + 0.1,
-                            1.0
-                        )
-                        updated = True
+                        self.cog.adjust_confidence(entry, +0.12)
+                        entry["last_modified"] = time.time()
+                        save_json(DATA_PATH, self.cog.translate_db)
 
-        if updated:
-            save_json(DATA_PATH, self.cog.translate_db)
-            await interaction.response.send_message(
-                "✅ 翻訳を修正しました。ありがとうございます。",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                "⚠️ 該当する翻訳エントリが見つかりませんでした。",
-                ephemeral=True
-            )
-            
+                        await interaction.response.send_message(
+                            "✅ 翻訳を学習しました。",
+                            ephemeral=True
+                        )
+                        return
+
+        await interaction.response.send_message(
+            "⚠️ 対応する翻訳が見つかりませんでした。",
+            ephemeral=True
+        )
+
 async def setup(bot):
     await bot.add_cog(Core(bot))
