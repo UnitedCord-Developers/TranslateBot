@@ -13,9 +13,8 @@ import random
 DATA_PATH = "data/dictionaries/translate.json"
 CHANNEL_CONFIG_PATH = "data/channel_links.json"
 MEANING_DISTANCE_PATH = "data/dictionaries/meaning_distance.json"
-GOOGLE_TRANSLATE_API_KEY = "YOUR_GOOGLE_API_KEY"
-GOOGLE_TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
-
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
 SUPPORTED_LANGS = ["ja", "en", "ko", "zh"]
 
 def load_json(path, default):
@@ -93,7 +92,7 @@ class Core(commands.Cog):
 
         if meaning_id:
             self.meaning_clusters[cid][meaning_id] += 1
-            self.learn_meaning_distance(str(message.channel.id))
+            self.learn_meaning_distance()
 
     def learn_meaning_distance(self):
         all_logs = []
@@ -118,20 +117,22 @@ class Core(commands.Cog):
         elapsed = now - self.last_decay_check
 
         if elapsed < 3600:
-            return  # 1時間に1回で十分
+            return
+
+        decay_factor = 0.5 ** (elapsed / self.CONFIDENCE_HALF_LIFE)
 
         for entry in self.translate_db["entries"].values():
-            conf = entry.get("confidence", 0.3)
+            entry["confidence"] = max(
+                0.05,
+                entry.get("confidence", 0.3) * decay_factor
+            )
 
-            decay_factor = 0.5 ** (elapsed / self.CONFIDENCE_HALF_LIFE)
-            entry["confidence"] = max(0.05, conf * decay_factor)
-
-        for entry in self.translate_db["entries"].values():
             ctx = entry.get("context", {}).get("emotion", {})
             for k in list(ctx.keys()):
                 ctx[k] *= decay_factor
                 if ctx[k] < 0.05:
                     del ctx[k]
+
         self.last_decay_check = now
         save_json(DATA_PATH, self.translate_db)
     # =========================
@@ -282,30 +283,54 @@ class Core(commands.Cog):
         await self.broadcast(message, translated, source_lang)
 
     # =========================
-    # Google API 翻訳
+    # Gemini 翻訳（教師AI）
     # =========================
     async def translate_api(self, text, src_lang):
-        results = {}
-        for target in SUPPORTED_LANGS:
-            if target == src_lang:
-                continue
-            payload = {
-                "q": text,
-                "source": src_lang,
-                "target": target,
-                "key": GOOGLE_TRANSLATE_API_KEY
-            }
-            async with session.post(GOOGLE_TRANSLATE_URL, json=payload) as resp:
-                if resp.status != 200:
-                    continue
+        headers = {
+            "Content-Type": "application/json"
+        }
 
-                data = await resp.json()
-                try:
-                    results[target] = data["data"]["translations"][0]["translatedText"]
-                except (KeyError, IndexError, TypeError):
-                    continue
+        prompt = (
+            "You are a translation assistant.\n"
+            "Translate the following message naturally, preserving tone, emotion, and intent.\n"
+            "Avoid literal translation.\n\n"
+            f"Source language: {src_lang}\n"
+            f"Message: {text}\n\n"
+            "Return translations in JSON format like:\n"
+            "{ \"ja\": \"...\", \"en\": \"...\", \"ko\": \"...\", \"zh\": \"...\" }"
+        )
 
-        self.register_translation(text, src_lang, results)
+        payload = {
+            "contents": [
+                {"parts": [{"text": prompt}]}
+            ]
+        }
+
+        async with self.http_session.post(
+            f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
+            headers=headers,
+            json=payload
+        ) as resp:
+            if resp.status != 200:
+                return {}
+
+            data = await resp.json()
+
+        try:
+            text_block = data["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = json.loads(text_block)
+        except Exception:
+            return {}
+
+        results = {
+            lang: txt
+            for lang, txt in parsed.items()
+            if lang in SUPPORTED_LANGS and lang != src_lang
+        }
+
+        if results:
+            self.register_translation(text, src_lang, results)
+
         return results
 
     # =========================
