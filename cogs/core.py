@@ -12,7 +12,7 @@ import random
 
 DATA_PATH = "data/dictionaries/translate.json"
 CHANNEL_CONFIG_PATH = "data/channel_links.json"
-
+MEANING_DISTANCE_PATH = "data/dictionaries/meaning_distance.json"
 GOOGLE_TRANSLATE_API_KEY = "YOUR_GOOGLE_API_KEY"
 GOOGLE_TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
 
@@ -29,20 +29,37 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def save_meaning_distance(path, data):
+    serializable = {
+        a: dict(b)
+        for a, b in data.items()
+    }
+    save_json(path, {
+        "meta": {"updated": time.time()},
+        "distances": serializable
+    })
 
+def load_meaning_distance(path):
+    raw = load_json(path, {"distances": {}})
+    md = defaultdict(lambda: defaultdict(float))
+    for a, bs in raw.get("distances", {}).items():
+        for b, v in bs.items():
+            md[a][b] = float(v)
+    return md
     
 class Core(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.translate_db = load_json(DATA_PATH, {"meta": {}, "entries": {}})
+        self.meaning_distance = load_meaning_distance(MEANING_DISTANCE_PATH)
         self.channel_links = load_json(CHANNEL_CONFIG_PATH, {})
         self.context_logs = {}
         self.meaning_clusters = defaultdict(lambda: defaultdict(int))
         self.CONTEXT_WINDOW = 20
-        self.meaning_distance = defaultdict(lambda: defaultdict(float))
         self.last_decay_check = time.time()
         self.CONFIDENCE_HALF_LIFE = 60 * 60 * 24 * 7  # 7日
-
+        self.http_session = aiohttp.ClientSession()
+        
     def detect_emotion(self, text, lang):
         t = text.lower()
 
@@ -90,7 +107,8 @@ class Core(commands.Cog):
 
             self.meaning_distance[a][b] += 0.1
             self.meaning_distance[b][a] += 0.1
-    
+
+        save_meaning_distance(MEANING_DISTANCE_PATH, self.meaning_distance)
     def decay_confidence(self):
         now = time.time()
         elapsed = now - self.last_decay_check
@@ -106,6 +124,12 @@ class Core(commands.Cog):
 
         self.last_decay_check = now
         save_json(DATA_PATH, self.translate_db)
+        for entry in self.translate_db["entries"].values():
+            ctx = entry.get("context", {}).get("emotion", {})
+            for k in list(ctx.keys()):
+                ctx[k] *= decay_factor
+                if ctx[k] < 0.05:
+                    del ctx[k]
     # =========================
     # /setchat
     # =========================
@@ -185,8 +209,9 @@ class Core(commands.Cog):
 
             # 感情一致補正（context 名を使う）
             if entry.get("context"):
-                if emotion in entry["context"]:
-                    score += 0.2
+                emotion_ctx = entry.get("context", {}).get("emotion", {})
+                if emotion in emotion_ctx:
+                    score += emotion_ctx[emotion] * 0.4
 
             # リプライ補正
             if message.reference:
@@ -268,8 +293,14 @@ class Core(commands.Cog):
                     "key": GOOGLE_TRANSLATE_API_KEY
                 }
                 async with session.post(GOOGLE_TRANSLATE_URL, json=payload) as resp:
+                    if resp.status != 200:
+                        continue
+
                     data = await resp.json()
-                    results[target] = data["data"]["translations"][0]["translatedText"]
+                    try:
+                        results[target] = data["data"]["translations"][0]["translatedText"]
+                    except (KeyError, IndexError, TypeError):
+                        continue
 
         self.register_translation(text, src_lang, results)
         return results
@@ -281,7 +312,10 @@ class Core(commands.Cog):
         new_id = str(max(map(int, self.translate_db["entries"].keys()), default=1000) + 1)
 
         self.translate_db["entries"][new_id] = {
-            "context": [],
+            "context": {
+                "emotion": {},
+                "usage": {}
+            },
             "confidence": 0.3,
             "last_modified": time.time(),
             "languages": {
@@ -299,21 +333,23 @@ class Core(commands.Cog):
             if info["lang"] == src_lang:
                 continue
 
-            async with aiohttp.ClientSession() as session:
-                webhook = discord.Webhook.from_url(info["webhook"], session=session)
+            webhook = discord.Webhook.from_url(
+                info["webhook"],
+                session=self.http_session
+            )
 
-                content = translated.get(info["lang"])
-                if not content:
-                    continue
+            content = translated.get(info["lang"])
+            if not content:
+                continue
 
-                sent = await webhook.send(
-                    content,
-                    username=message.author.display_name,
-                    avatar_url=message.author.display_avatar.url,
-                    wait=True
-                )
+            sent = await webhook.send(
+                content,
+                username=message.author.display_name,
+                avatar_url=message.author.display_avatar.url,
+                wait=True
+            )
 
-                await sent.add_reaction("❓")
+            await sent.add_reaction("❓")
 
     # =========================
     # ❓リアクション（統合版）
@@ -321,6 +357,8 @@ class Core(commands.Cog):
     @commands.Cog.listener()
     async def on_reaction_add(self, reaction, user):
         if user.bot or str(reaction.emoji) != "❓":
+            return
+        if reaction.message.webhook_id is None:
             return
 
         message = reaction.message
@@ -371,6 +409,9 @@ class TranslationFixModal(discord.ui.Modal, title="翻訳修正"):
                     if fixed not in variants:
                         variants.append(fixed)
                         self.cog.adjust_confidence(entry, +0.12)
+                        emotion = self.cog.detect_emotion(fixed, lang)
+                        ctx = entry.setdefault("context", {}).setdefault("emotion", {})
+                        ctx[emotion] = min(ctx.get(emotion, 0.0) + 0.2, 1.0)
                         entry["last_modified"] = time.time()
                         save_json(DATA_PATH, self.cog.translate_db)
 
@@ -494,3 +535,5 @@ class TranslationActionView(discord.ui.View):
 
 async def setup(bot):
     await bot.add_cog(Core(bot))
+async def cog_unload(self):
+    await self.http_session.close()
