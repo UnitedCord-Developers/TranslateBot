@@ -7,6 +7,8 @@ import aiohttp
 import asyncio
 from difflib import SequenceMatcher
 import time
+from collections import deque
+import time
 
 DATA_PATH = "data/dictionaries/translate.json"
 CHANNEL_CONFIG_PATH = "data/channel_links.json"
@@ -32,6 +34,8 @@ class Core(commands.Cog):
         self.bot = bot
         self.translate_db = load_json(DATA_PATH, {"meta": {}, "entries": {}})
         self.channel_links = load_json(CHANNEL_CONFIG_PATH, {})
+        self.context_logs = {}
+        self.CONTEXT_WINDOW = 20
 
     # =========================
     # /setchat
@@ -83,8 +87,53 @@ class Core(commands.Cog):
         )
 
     # =========================
-    # メッセージ監視
+    # メッセージ選択監視
     # =========================
+    
+    def choose_meaning_with_context(self, text, src_lang, message):
+    cid = str(message.channel.id)
+    logs = self.context_logs.get(cid, [])
+
+    candidates = []
+
+    for eid, entry in self.translate_db["entries"].items():
+        if src_lang not in entry["languages"]:
+            continue
+
+        base_score = entry.get("confidence", 0.3)
+
+        # 文言類似
+        for phrase in entry["languages"][src_lang]:
+            sim = SequenceMatcher(None, text.lower(), phrase.lower()).ratio()
+            if sim > 0.85:
+                base_score += sim * 0.4
+
+        # 文脈補正
+        for log in reversed(logs):
+            time_diff = message.created_at.timestamp() - log["timestamp"]
+            if time_diff > 300:
+                break
+
+            if log["meaning_id"] == eid:
+                base_score += 0.3
+
+            if message.reference and log["author"] == message.reference.resolved.author.id:
+                base_score += 0.4
+
+        candidates.append((eid, base_score))
+
+    if not candidates:
+        return None, None
+
+    best_id, score = max(candidates, key=lambda x: x[1])
+
+    if score < 0.5:
+        return None, None
+
+    entry = self.translate_db["entries"][best_id]
+    results = {lang: variants[0] for lang, variants in entry["languages"].items()}
+    return results, best_id
+    
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -97,13 +146,19 @@ class Core(commands.Cog):
         source_lang = self.channel_links[cid]["lang"]
         content = message.content
 
-        translated, entry = self.translate_from_json(content, source_lang)
+        translated, meaning_id = self.choose_meaning_with_context(
+            content, source_lang, message
+        )
 
         if translated:
-            self.adjust_confidence(entry, +0.03)
+            self.adjust_confidence(
+                self.translate_db["entries"][meaning_id], +0.03
+            )
         else:
             translated = await self.translate_api(content, source_lang)
+            meaning_id = None
 
+        self.log_context(message, meaning_id)
         await self.broadcast(message, translated, source_lang)
 
     # =========================
